@@ -1,0 +1,266 @@
+#Amend string below 
+data_loc = "C:/Users/tanal/Desktop/Microarray/Human/"
+setwd(data_loc)
+
+#Installation of BiocManager if system lacks it
+if (!requireNamespace("BiocManager")){
+  install.packages("BiocManager")
+}
+
+#Installation of required packages if system lacks them
+#Double check to remove unnecessary packages from [packages]
+packages <- c("GEOquery","huex10sttranscriptcluster.db", "oligo", "limma","pd.huex.1.0.st.v2")
+for (package in packages){
+  if (!requireNamespace(package, quietly = TRUE)){
+    BiocManager::install(package)
+  }
+}
+
+#Loading of required packages
+lapply(c(packages, "RColorBrewer"), library, character.only = TRUE)
+
+#Download of GSE data
+gse <- getGEO('GSE143150',GSEMatrix = FALSE)
+
+#Function to extract genotype descriptors
+gntype <- function(gsm){
+  Meta(gsm)[["characteristics_ch1"]][2]
+}
+
+#Function to extract media descriptors
+media <- function(gsm){
+  Meta(gsm)[["characteristics_ch1"]][3]
+}
+
+#Creation of Phenodata dataframe with sample labels and descriptors-of-interest
+pd <- data.frame(genotype = as.factor(sapply(GSMList(gse),gntype)),treatment = as.factor(sapply(GSMList(gse),media)))
+
+#Making the descriptors-of-interest easier to read
+levels(pd$genotype) <- c("KD", "WT")
+levels(pd$treatment) <- c("DM", "FM")
+
+#Reordering the levels of factors to ensure heatmap is in right order later
+pd$treatment <- factor(pd$treatment,levels(pd$treatment)[c(2:1)])
+pd$genotype <- factor(pd$genotype,levels(pd$genotype)[c(2:1)])
+pd <- pd[order(pd$treatment,pd$genotype),]
+
+#Obtain listing of CEL files in working directory including full file paths
+cel_files <- list.celfiles(data_loc, full.names = TRUE)
+
+#Ensuring ordering of CEL files matches those of PhenoData row ordering
+cel_final <- c()
+for (item in rownames(pd)){
+  print(item)    ###had to switch to my own "list" object
+  cel_final <- c(cel_final, grep(item, list, value=TRUE))
+}
+
+#Reading of CEL files in desired order
+raw_data <- read.celfiles(cel_final, phenoData = new("AnnotatedDataFrame", pd))
+
+#RMA
+eset <- rma(raw_data)
+
+#Accessing data from ExpressionSet
+annotation(eset)
+pData(eset)
+exprs(eset)
+experimentData(eset)
+featureData(eset)
+
+#Creating model  
+geno_media <- paste(eset$genotype, eset$treatment, sep=".")
+geno_media <- factor(geno_media, levels = c("KD.DM","WT.DM","KD.FM","WT.FM") )
+model <- model.matrix(~0 + geno_media)
+colnames(model) <- levels(geno_media)
+fit <- lmFit(eset,model)
+
+#Creating contrast
+cont.matrix <- makeContrasts(DMvFMinWT = WT.DM - WT.FM,
+                             DMvFMinKD = KD.DM - KD.FM,
+                             KDvWTinFM = KD.FM - WT.FM,
+                             KDvWTinDM = KD.DM - WT.DM,
+                             Diff = (KD.DM - KD.FM) - (WT.DM - WT.FM),
+                             levels = model)
+
+#Making comparisons
+fit.constrast <- contrasts.fit(fit,cont.matrix)
+fit.ebayes <- eBayes(fit.constrast)
+results <- decideTests(fit.ebayes, lfc = 1, p.value = 0.05)
+
+#Analysis
+venn_label = c("DM vs FM in WT", "DM vs FM in KD", "Difference")
+venn_subset = results[,c(1,2,5)]
+venn_cex = c(1.2,1,1)
+vennDiagram(results, names = c("DM vs FM in WT", "DM vs FM in KD",
+                               "KD vs WT in FM", "KD vs WT in DM", "Difference"), cex = c(0.9,1,0.7))
+vennDiagram(venn_subset, names = venn_label, cex = venn_cex)
+vennDiagram(venn_subset, names = venn_label, cex = venn_cex, include = "up")
+vennDiagram(venn_subset, names = venn_label, cex = venn_cex, include = "down")
+
+#Further analysis
+int_genes_wt <- topTable(fit.ebayes,coef = "DMvFMinWT", number=Inf,p.value = 0.05,lfc=1)
+write.csv(int_genes_wt, "DMvFMinWT.csv")
+int_genes_wt_anno <- AnnotationDbi::select(huex10sttranscriptcluster.db,
+                                           rownames(int_genes_wt), 
+                                           c("SYMBOL","ENTREZID","GENENAME"),
+                                           keytype="PROBEID")
+write.csv(int_genes_wt_anno, "DMvFMinWT_anno.csv")
+
+int_genes_kd <- topTable(fit.ebayes,coef = "DMvFMinKD", number=Inf,p.value = 0.05,lfc=1)
+write.csv(int_genes_kd, "DMvFMinKD.csv")
+int_genes_kd_anno <- AnnotationDbi::select(huex10sttranscriptcluster.db,
+                                           rownames(int_genes_kd), 
+                                           c("SYMBOL","ENTREZID","GENENAME"),
+                                           keytype="PROBEID")
+write.csv(int_genes_kd_anno, "DMvFMinKD_anno.csv")
+
+#Volcano plots
+volcanoplot(fit.ebayes, coef= 1, main=sprintf("DM vs FM in WT: %d statistically significant features",nrow(int_genes_wt)))
+points(int_genes_wt[['logFC']],-log10(int_genes_wt[['P.Value']]),col='red')
+abline(v=c(-1,1), col = "blue")
+
+volcanoplot(fit.ebayes, coef= 2, main=sprintf("DM vs FM in KD: %d statistically significant features",nrow(int_genes_kd)))
+points(int_genes_kd[['logFC']],-log10(int_genes_kd[['P.Value']]),col='red')
+abline(v=c(-1,1), col = "blue")
+
+#Union set of probes and heatmap plot
+ps_union <- union(rownames(int_genes_wt), rownames(int_genes_kd))
+eset_of_interest <- eset[ps_union,]
+heatmap(exprs(eset_of_interest))
+heatmap(exprs(eset_of_interest), labCol=paste(eset$genotype, eset$treatment, sep="."),
+        labRow=NA, col= rev(brewer.pal(10, "RdBu")), distfun = function(x) as.dist(1-cor(t(x))), Colv = NA)
+
+#Cluster analysis
+ps_wt_ex = setdiff(rownames(int_genes_wt), rownames(int_genes_kd))
+ps_kd_ex = setdiff(rownames(int_genes_kd), rownames(int_genes_wt))
+ps_intrsct = intersect(rownames(int_genes_kd), rownames(int_genes_wt))
+
+#Annotation
+ps_wt_ex_anno <- AnnotationDbi::select(huex10sttranscriptcluster.db,ps_wt_ex,
+                                       c("SYMBOL","ENTREZID","GENENAME"),keytype="PROBEID")
+write.csv(ps_wt_ex_anno, "ps_wt_ex.csv")
+
+ps_kd_ex_anno <- AnnotationDbi::select(huex10sttranscriptcluster.db,ps_kd_ex,
+                                       c("SYMBOL","ENTREZID","GENENAME"),keytype="PROBEID")
+write.csv(ps_kd_ex_anno, "ps_kd_ex.csv")
+
+ps_intrsct_anno <- AnnotationDbi::select(huex10sttranscriptcluster.db,ps_intrsct,
+                                         c("SYMBOL","ENTREZID","GENENAME"),keytype="PROBEID")
+write.csv(c(ps_intrsct_anno,ps_intrsctlogfc), "ps_intrsct.csv")
+
+#Fine-scale Analysis, cluster genes sorted by direction of log fold change
+detailed_analysis <- function(genes, probeset, drctn){
+  temp1 <- genes[probeset,]
+  if(drctn == "up"){
+    temp1 <- rownames(temp1[temp1$logFC > 0,])
+  } else{
+    temp1 <- rownames(temp1[temp1$logFC < 0,])
+  }
+  temp2 <- AnnotationDbi::select(huex10sttranscriptcluster.db,temp1,
+                                 c("SYMBOL","ENTREZID","GENENAME"),keytype="PROBEID")
+  return(temp2)
+}
+
+write.csv(detailed_analysis(int_genes_kd, ps_kd_ex, "up"), "ps_kd_ex_up.csv")
+write.csv(detailed_analysis(int_genes_kd, ps_kd_ex, "down"), "ps_kd_ex_down.csv")
+write.csv(detailed_analysis(int_genes_wt, ps_wt_ex, "up"), "ps_wt_ex_up.csv")
+write.csv(detailed_analysis(int_genes_wt, ps_wt_ex, "down"), "ps_wt_ex_down.csv")
+write.csv(detailed_analysis(int_genes_wt, ps_intrsct, "up"), "ps_intrsct_up.csv")
+write.csv(detailed_analysis(int_genes_wt, ps_intrsct, "down"), "ps_intrsct_down.csv")
+
+#Slopecharts
+
+#top 10 probeIDs for WT only cluster
+WTclustertop10<-ps_wt_ex[1:10] 
+
+#top 10 probeIDs for KD only cluster & removes the probeid #2 from the list as its symbol mapping is NA
+KDclustertop10<-ps_kd_ex[c(1,3:11)]
+
+#top 10 probeIDs in both WT & KD cells
+interscttop10<- ps_intrsct[1:10]
+
+#dataframe with fluorescence values of the 12 samples for each probeID, processed by RMA
+adjprobefluor<-data.frame(eset@assayData$exprs)
+
+#fluorescence data for top 10 ProbeIDs + naming the probesets using symbols for each cluster
+WTtop10expr<-adjprobefluor[WTclustertop10,]
+
+WTlabel<-AnnotationDbi::select(huex10sttranscriptcluster.db,
+                               rownames(WTtop10expr), 
+                               c("SYMBOL"),
+                               keytype="PROBEID")
+
+rownames(WTtop10expr)<-WTlabel$SYMBOL
+
+KDtop10expr<-adjprobefluor[KDclustertop10,]
+KDlabel<-AnnotationDbi::select(huex10sttranscriptcluster.db,
+                               rownames(KDtop10expr), 
+                               c("SYMBOL"),
+                               keytype="PROBEID")
+
+#the last gene has two symbol mappings, removed the ambiguous symbol
+KDlabel<-KDlabel[1:10,]
+rownames(KDtop10expr)<-KDlabel$SYMBOL
+
+intrscttop10expr<-adjprobefluor[interscttop10,]
+intrsctlabel<-AnnotationDbi::select(huex10sttranscriptcluster.db,
+                                    rownames(intrscttop10expr), 
+                                    c("SYMBOL"),
+                                    keytype="PROBEID")
+
+#last gene has 2 labels, removed ambiguous label
+intrsctlabel<-intrsctlabel[1:10,] 
+rownames(intrscttop10expr)<-intrsctlabel$SYMBOL
+
+#Extracting DM/FM specific fluorescence data for each gene cluster (WT, KD and Intersect clusters)
+WTFM<-WTtop10expr[1:3]
+WTDM<-WTtop10expr[7:9]
+KDFM<-KDtop10expr[4:6] 
+KDDM<-KDtop10expr[10:12]
+intrFM<-intrscttop10expr[1:6]
+intrDM<-intrscttop10expr[7:12]
+
+#calculating mean fluorescence intensity for the 3 samples with the same treatment for each cluster 
+WTFM$FMaverage<-rowMeans(WTFM)
+WTDM$DMaverage<-rowMeans(WTDM)
+
+KDFM$FMaverage<-rowMeans(KDFM)
+KDDM$DMaverage<-rowMeans(KDDM)
+
+intrFM$FMaverage<-rowMeans(intrFM)
+intrDM$DMaverage<-rowMeans(intrDM)
+
+#Creating data frame to be read by GGplot
+WTDMframe<-data.frame(medium="DM",genesymbol=rownames(WTDM), AveFluorescence=WTDM$DMaverage)
+WTFMframe<-data.frame(medium="FM",genesymbol=rownames(WTFM), AveFluorescence=WTFM$FMaverage)
+DMvFMframeinWT<-rbind(WTFMframe,WTDMframe)
+
+KDDMframe<-data.frame(medium="DM",genesymbol=rownames(KDDM), AveFluorescence=KDDM$DMaverage)
+KDFMframe<-data.frame(medium="FM",genesymbol=rownames(KDFM), AveFluorescence=KDFM$FMaverage)
+DMvFMframeinKD<-rbind(KDFMframe,KDDMframe)
+
+intrDMframe<-data.frame(medium="DM",genesymbol=rownames(intrDM), AveFluorescence=intrDM$DMaverage)
+intrFMframe<-data.frame(medium="FM",genesymbol=rownames(intrFM), AveFluorescence=intrFM$FMaverage)
+DMvFMframeinIntersect<-rbind(intrFMframe,intrDMframe)
+
+#making the GGplot 
+
+library(ggplot2)
+ggplot(data = DMvFMframeinWT, aes(x = medium, y = AveFluorescence, group = genesymbol, shape=genesymbol)) +
+  geom_line(aes(color = genesymbol), size = 0.75) +
+  scale_shape_manual(values=c(16:25))+
+  geom_point(aes(color = genesymbol), size = 2,fill="white")+
+  labs(title = "Top 10 Genes with expression change in Wild-type cells")
+
+ggplot(data = DMvFMframeinKD, aes(x = medium, y = AveFluorescence, group = genesymbol, shape=genesymbol)) +
+  geom_line(aes(color = genesymbol), size = 0.75) +
+  scale_shape_manual(values=c(16:25))+
+  geom_point(aes(color=genesymbol), size = 2.5, fill="white")+
+  ggtitle("Top 10 Genes with expression change in JMJD2B Knockdown cells")+
+  theme(plot.title=element_text(size=12))
+
+ggplot(data = DMvFMframeinIntersect, aes(x = medium, y = AveFluorescence, group = genesymbol, shape=genesymbol)) +
+  geom_line(aes(color = genesymbol), size = 0.75) +
+  scale_shape_manual(values=c(25:17,15))+
+  geom_point(aes(color=genesymbol), size = 2.5, fill="white")+
+  labs(title = "Top 10 Genes with expression change in WT & KD cells")
